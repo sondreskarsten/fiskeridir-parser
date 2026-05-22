@@ -1,101 +1,80 @@
 # fiskeridir-parser
 
-Change-data-capture parser for the Norwegian fishing vessel registry. Reads the daily raw vessel dump from fiskeridir-collector, compares it against the prior day's snapshot, and emits a 12-column unified changelog describing exactly what changed: new vessels, disappeared vessels, modified fields, and ownership transfers.
+Pattern A bulk-diff CDC for the Norwegian fishing vessel registry. Reads daily raw dumps from fiskeridir-collector, flattens, admits to universe, diffs against prior snapshot, emits a 12-column unified changelog.
 
-## What does it detect?
+## LUAS
 
-Every day this pipeline answers: **what changed in the Norwegian fishing fleet since yesterday?** The answer is a structured event stream where each row is a single observed change:
+**(orgnr, vessel_id)**. One row in the snapshot = one vessel owned by one company. The same physical hull (vessel_id) appears under different orgnrs over time as ownership transfers happen.
 
-| Event type | What it means | Credit signal |
+## Snapshot schema
+
+| Column | Type | Nullable | Notes |
+|---|---|---|---|
+| `orgnr` | string | no | 9-digit company ID (key) |
+| `vessel_id` | string | no | Fiskeridir hull ID (key) |
+| `name` | string | no | Vessel name |
+| `length` | float64 | yes | Greatest length in meters |
+| `build_year` | int32 | yes | |
+| `rebuild_year` | int32 | yes | NULL if never rebuilt |
+| `engine_power_kw` | int32 | yes | |
+| `engine_build_year` | int32 | yes | |
+| `radio_call_sign` | string | yes | NULL for ~10% of small boats |
+| `municipality_code` | string | yes | 4-digit kommune code |
+| `tonnage_gt` | float64 | yes | Gross tonnage (normalized) |
+| `tonnage_type` | string | yes | "1969" or "other" |
+| `last_lat` | float64 | yes | From BarentsWatch enrichment (currently NULL) |
+| `last_lon` | float64 | yes | |
+| `last_position_ts` | timestamp | yes | |
+
+**Cardinality**: ~4,100 rows/day (after admission drops ~500 person-only + ~50 multi-owner + ~15 duplicate hulls).
+
+**Null rates**: `radio_call_sign` NULL for ~480 vessels (10%) — these are sub-15m boats without AIS. They cannot be tracked via AIS and will not appear in the fleet panel's live position column.
+
+## CDC events
+
+| event_type | event_subtype | Meaning | Typical volume |
+|---|---|---|---|
+| `new` | `vessel` | Vessel registered to this orgnr | ~2/week |
+| `disappeared` | `vessel` | Vessel gone from this orgnr | ~2/week |
+| `modified` | `vessel` | Operational fields changed (name, length, engine, callsign) | ~5/week |
+| `modified` | `vessel_admin` | Only admin fields changed (municipality on reform dates) | rare |
+
+**Vessel transfers**: a sale produces `disappeared` on seller's orgnr + `new` on buyer's orgnr, same `vessel_id`, same date. Join on `vessel_id` and `detected_time` to reconstruct transfers. ~1-2 transfers/week across the fleet.
+
+## Admission rules (applied before diffing)
+
+1. **Person-only vessels dropped** — no orgnr available (~15% of raw)
+2. **Multi-owner vessels** — keep primary owner only (highest ownership %)
+3. **Duplicate hulls** — same (registrationMark, radioCallSign) under different vessel_ids → keep most complete
+
+All drops logged at `parsed/v1/drops/{date}.jsonl` with reason codes.
+
+## Join keys
+
+| To join with | Key | Coverage |
 |---|---|---|
-| `new` | Vessel registered to this orgnr for the first time | **Vessel purchase** — new asset on balance sheet, likely financed |
-| `disappeared` | Vessel was on this orgnr yesterday, gone today | **Vessel sold, scrapped, or deregistered** — collateral reduction |
-| `modified` (vessel) | Fields changed: name, length, GT, engine, call sign, build year | **Rebuild, re-engine, or rename** — CAPEX signal or identity change |
-| `modified` (vessel_admin) | Only administrative fields changed (municipality code on reform dates) | Noise — municipality merger, not operational |
+| Fangstdata (catch) | `radio_call_sign = fangstdata.radiokallesignal_seddel` | 90% of fangstdata rows (10% = foreign vessels) |
+| AIS positions | `radio_call_sign → NSR.callsign → mmsi` | Indirect, via kystverket-ais-parser |
+| Finstat | `orgnr = finstat.OffentligNr` (zero-pad float to 9-char string) | ~60% of fishing orgnrs have finstat |
+| Løsøre | `orgnr = losore.orgnr` | ~30% of fishing orgnrs have active liens |
+| Integration ledger | `orgnr + data_source='fiskeridir_vessel'` | Admitted |
 
-**Vessel buying and selling** is the most important signal. When a fishing company sells a trawler to another company, the registry shows:
-1. `disappeared` on the seller's orgnr (vessel gone from their fleet)
-2. `new` on the buyer's orgnr (vessel appears in their fleet)
-3. Both events share the same `vessel_id` and occur on the same `detected_time`
-
-By joining disappeared + new events on `vessel_id` and date, you reconstruct the full transfer chain. This is visible 6-18 months before the transaction appears in either company's financial statements.
-
-## LUAS (Lowest Unit of Analysis)
-
-One row = one (orgnr, vessel_id) pair. A company that owns 3 vessels produces 3 rows in the snapshot. When vessel_id 12345 moves from orgnr A to orgnr B, that's 2 changelog events (1 disappeared + 1 new), not 1.
-
-**Key**: `(orgnr, vessel_id)` — compound because the same physical hull (vessel_id) can change owners (orgnr) over time.
-
-## What's in each vessel record?
-
-| Field | Example | Why it matters |
-|---|---|---|
-| `orgnr` | "979356749" | Corporate owner — the join key to financial statements, liens, and corporate events |
-| `vessel_id` | "12345" | Fiskeridir's internal hull identifier — stable across ownership transfers |
-| `name` | "SLAATTERØY" | Vessel name — changes on sale or rename |
-| `length` | 69.7 | Length in meters — determines length group (regulatory category) |
-| `build_year` | 2003 | Year built — proxy for vessel condition and remaining useful life |
-| `rebuild_year` | 2015 | Year of last major rebuild — CAPEX indicator |
-| `engine_power_kw` | 5400 | Engine power — capacity indicator |
-| `engine_build_year` | 2015 | Engine vintage — maintenance cycle indicator |
-| `radio_call_sign` | "LGWH" | Radio call sign — the bridge to AIS vessel tracking |
-| `municipality_code` | "1201" | Registration municipality — geographic signal (Bergen = deep-sea fleet, Lofoten = coastal) |
-| `tonnage_gt` | 2187 | Gross tonnage — physical capacity measure |
-| `last_lat`, `last_lon` | 60.3, 5.1 | Last AIS position (enriched from BarentsWatch during parse) |
-
-## Admission rules
-
-Not every record from the API enters the snapshot. Three filters, applied in order:
-
-1. **No person-only vessels.** If the API record has no company owner (only a person), there's no orgnr to key on. Out of universe. (~15% of raw records)
-2. **No multi-owner vessels.** When the API returns multiple owners for one vessel_id, it's a data artifact (secondary legal registrations), not balance-sheet co-ownership. We keep the primary owner only.
-3. **No duplicate hulls.** Rare: same (registrationMark, radioCallSign) under different vessel_ids. Keep the most-complete record.
-
-All dropped records are logged with reasons at `parsed/v1/drops/{date}.jsonl`.
-
-## Pattern A: Bulk-diff CDC
-
-This is a Pattern A pipeline. The changelog is an INDEX — it tells you *which* fields changed, but old/new values live in the dated snapshots. To get "what was the vessel's length before and after the change on May 15?", join the changelog to `state/2025-05-14.parquet` (old) and `state/2025-05-15.parquet` (new).
+**Gotcha**: finstat `OffentligNr` is float64 in the source parquet. You must `LPAD(CAST(CAST(OffentligNr AS BIGINT) AS VARCHAR), 9, '0')` before joining. Missing this produces zero matches.
 
 ## GCS layout
 
 ```
 gs://sondre_brreg_data/fiskeridir/
-├── raw/{date}/vessels.jsonl.gz          from fiskeridir-collector
-├── parsed/v1/
-│   ├── state/{date}.parquet             daily snapshot: all admitted vessels
-│   ├── drops/{date}.jsonl               admission drop log
-│   └── meta/{date}.json                 run metadata
-└── cdc/
-    └── changelog/{date}.parquet         12-column unified events
+├── raw/{date}/vessels.jsonl.gz           ← from collector
+├── parsed/v1/state/{date}.parquet        daily snapshot (admitted rows)
+├── parsed/v1/drops/{date}.jsonl          admission drop log
+├── parsed/v1/meta/{date}.json            run metadata
+└── cdc/changelog/{date}.parquet          12-column unified events
 ```
 
-## Changelog schema (12-column unified)
+## Downstream
 
-Identical to the platform's integration-layer schema:
-
-| Column | Type | Notes |
-|---|---|---|
-| `orgnr` | string | 9-digit org number |
-| `document_id` | string | `{orgnr}_{vessel_id}` |
-| `data_source` | string | Always `fiskeridir_vessel` |
-| `event_type` | string | `new` / `modified` / `disappeared` |
-| `event_subtype` | string | `vessel` / `vessel_admin` |
-| `summary` | string | Human-readable: "New vessel SLAATTERØY (69.7m, 2003)" |
-| `changed_fields` | string | JSON array: `["length","engine_power_kw"]` |
-| `valid_time` | timestamp | When the change occurred (best estimate: snapshot date) |
-| `detected_time` | timestamp | When CDC detected it |
-| `details_json` | string | NULL (Pattern A — values in snapshots) |
-| `source_run_mode` | string | `daily` / `bootstrap` |
-| `run_id` | string | UUID per execution |
-
-## Ledger admission
-
-Admitted to the integration-layer unified ledger as `data_source='fiskeridir_vessel'`. Events appear alongside enheter, roller, doffin, and other CDC streams — queryable via a single `SELECT * FROM ledger WHERE orgnr = '979356749'`.
-
-## Downstream consumers
-
-→ **kystverket-ais-parser**: uses `radio_call_sign` from the snapshot to bridge AIS mmsi → orgnr
-→ **fleet_panel**: joins snapshot to fangstdata and finstat on orgnr
-→ **integration-layer**: admits changelog to the unified ledger
-→ **barentswatch-ais-live**: uses callsign→orgnr bridge for live position enrichment
+→ kystverket-ais-parser (callsign→orgnr bridge)
+→ barentswatch-ais-live (same bridge)
+→ fleet_panel (snapshot joined to fangstdata + finstat)
+→ integration-layer (changelog admitted as `fiskeridir_vessel`)
